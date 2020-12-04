@@ -4,6 +4,7 @@ import torch.nn as nn ## NN 사용을 위해서
 import torch.nn.functional as F ## 활성함수 사용을 위해서
 import torch.optim as optim ## adam과 같은 학습 최적화 알고리즘 사용을 위해서
 from torch.distributions import Normal ## 분포 관련
+from torch.distributions import Categorical
 
 import numpy as np ## numpy 사용
 import time
@@ -22,12 +23,10 @@ class Actor_network(nn.Module):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
-        mu = self.fc4(x) ## NN의 output 이 mu 자체를 추정하는 것이다.
-
-        log_std = torch.zeros_like(mu) ## output size만큼 [0,..,0]으로 채워준다.
-        std = torch.exp(log_std) ## 지수함수 e^0은 1 이다. [1,..,1]로 채워준다. 즉 표준편차를 1로 하겠다는 것.
-        normal = Normal(mu, std)
-        return normal
+        x = self.fc4(x) 
+        action_distribution = F.softmax(x, dim=-1) ## ouput is action distribution.
+       
+        return action_distribution
     
 class Critic_network(nn.Module):
     def __init__(self, obs_size):
@@ -63,9 +62,11 @@ class Predictor_network(nn.Module):
 
         return f_st_1
 
-def get_action(normal): 
-    action = normal.sample()
-    return action.data.numpy()
+def get_action(action_distribution): 
+    distribution = Categorical(action_distribution) ## pytorch categorical 함수는 array에 담겨진 값들을 확률로 정해줍니다.
+    action = distribution.sample().item()
+    
+    return action
     
 def GAE(reward, mask, value, gamma): ## Reinforce 알고리즘을 보면 G라는 명칭이 있는데.
                                      ## 그 부분을 구해주는 함수입니다.
@@ -92,12 +93,15 @@ def GAE(reward, mask, value, gamma): ## Reinforce 알고리즘을 보면 G라는
     return Target_G, Advantage
     
 def surrogate_loss(actor, old_policy, Advantage, obs, action): # surrogate loss 계산.
-    normal = actor(torch.Tensor(obs))
-    policy = normal.log_prob(action)
-
-    entropy = normal.entropy()
+    action_distribution = actor(torch.Tensor(obs))
+    policy = action_distribution.gather(1,action)
+    log_policy = torch.log(policy)
+    log_old_policy = torch.log(old_policy)
     
-    ratio = torch.exp(policy - old_policy)
+    distribution = Categorical(action_distribution)
+    entropy = distribution.entropy()
+    
+    ratio = torch.exp(log_policy - log_old_policy)
     
     ratio_A = ratio * Advantage
 
@@ -128,24 +132,27 @@ def train(actor, critic, predictor, target_predictor, trajectories, actor_optimi
     extrinsic_reward = list(trajectories[:, 2])
     intrinsic_reward = list(trajectories[:, 3])
     mask = list(trajectories[:, 4]) 
-    old_policy = list(trajectories[:, 5])
+    old_policy = np.vstack(trajectories[:, 5])
     
-    action = torch.Tensor(action).squeeze(1)
+    obs = torch.Tensor(obs)
+    action = torch.LongTensor(action).unsqueeze(1)
     mask = torch.Tensor(mask)
-    
+    old_policy = torch.Tensor(old_policy)
+ 
     """ update predictor """
-    predictor_loss = get_MSE(predictor, target_predictor, obs, obs_std)
+    predictor_loss = get_MSE(predictor, target_predictor, obs.numpy(), obs_std)
     predictor_optimizer.zero_grad()
     predictor_loss.backward()
     predictor_optimizer.step()
-    obs_std = np.std(obs, 0)
+
+    obs_std = torch.std(obs, 0).numpy()
 
     extrinsic_reward = torch.Tensor(extrinsic_reward)
     intrinsic_reward = torch.Tensor(intrinsic_reward)
     intrinsic_reward = intrinsic_reward / torch.std(intrinsic_reward) # normalize intrinsic reward.
       
     """ calculate Return and Advantage """
-    ex_value, in_value = critic(torch.Tensor(obs))
+    ex_value, in_value = critic(obs)
     ex_Return, ex_Advantage = GAE(extrinsic_reward, mask, ex_value, 0.999) # best gamma, refer to fig 5.
     in_Return, in_Advantage = GAE(intrinsic_reward, mask, in_value, 0.99) # best gamma, refer to fig 5.
     
@@ -163,10 +170,10 @@ def train(actor, critic, predictor, target_predictor, trajectories, actor_optimi
             mini_batch = r_batch[batch_size * j: batch_size * (j+1)]
             mini_batch = torch.LongTensor(mini_batch)
             
-            obs_b = torch.Tensor(obs)[mini_batch]
-            action_b = torch.Tensor(action)[mini_batch]
+            obs_b = obs[mini_batch]
+            action_b = action[mini_batch]
             
-            total_Return_b = torch.Tensor(total_Return)[mini_batch].detach()
+            total_Return_b = total_Return[mini_batch].detach()
           
             """ critic loss """
             ex_value, in_value = critic(obs_b)
@@ -174,10 +181,9 @@ def train(actor, critic, predictor, target_predictor, trajectories, actor_optimi
             critic_loss = mse_loss(value.squeeze(1), total_Return_b).mean()
             
             """ actor loss """   
-            old_policy_b = torch.Tensor(old_policy)[mini_batch].detach()
+            old_policy_b = old_policy[mini_batch].detach()
             
-            Advantage_b = torch.Tensor(Advantage)[mini_batch]
-            Advantage_b = Advantage_b.unsqueeze(1)
+            Advantage_b = Advantage[mini_batch].unsqueeze(1)
                         
             ratio, L_CPI, entropy = surrogate_loss(actor, old_policy_b, Advantage_b, obs_b, action_b)
 
@@ -258,19 +264,17 @@ def main():
         for i in range(maximum_steps):
             #env.render() ## 게임을 실시간으로 실행하는 명령
             
-            normal = actor(torch.Tensor(obs)) ##actor로 부터 기댓값, 표준편차, logstd는 main에서는 안쓰임.
-            action = get_action(normal) ## 대표값과 표준편차를 통해 normalize한 각 action 별 수치를 return함. 여기서는 action이 2 개임.
-            old_policy = normal.log_prob(torch.Tensor(action))
-            
-            i_action = np.argmax(action)
-            
-            next_obs, extrinsic_reward, done, info = env.step(i_action) ## 선택된 가장 높은 action이 다음 step에 들어감.
+            action_distribution = actor(torch.Tensor(obs)) ##actor로 부터 action에 대한 softmax distribution을 얻는다.
+            action = get_action(action_distribution) ## sampling action.
+            old_policy = action_distribution[action] # 실제 선택된 action의 확률 값을 loss 계산을 위해 저장한다.
+
+            next_obs, extrinsic_reward, done, info = env.step(action) ## 선택된 가장 높은 action이 다음 step에 들어감.
             
             intrinsic_reward = get_MSE(predictor, target_predictor, next_obs, obs_std).item() # || f'(st+1) - f(st+1) ||^2
         
             mask = 0 if done else 1 ## 게임이 종료됬으면, done이 1이면 mask = 0 생존유무 확인.
                 
-            trajectories.append((obs, action, extrinsic_reward, intrinsic_reward, mask, old_policy.data.numpy()))
+            trajectories.append((obs, action, extrinsic_reward, intrinsic_reward, mask, old_policy.detach().numpy()))
             obs = next_obs # current observation을 next_observation으로 변경
                 
             ex_score += extrinsic_reward # extrinsic_reward 갱신.
@@ -291,9 +295,9 @@ def main():
             print('episode: ',epi,' step: ', step, 'ex_score: ', ex_score/print_interval, 'in_score: ', in_score/print_interval) # log 출력.
             ex_score = 0
             in_score = 0
-            with open('RND_ex.p', 'wb') as file:
+            with open('RND_ex2.p', 'wb') as file:
                 pickle.dump(save_ex_score, file)
-            with open('RND_in.p', 'wb') as file:
+            with open('RND_in2.p', 'wb') as file:
                 pickle.dump(save_in_score, file)
         
     env.close() ## 모든 학습이 끝나면 env 종료.
