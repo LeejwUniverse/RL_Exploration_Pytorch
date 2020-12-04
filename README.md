@@ -6,7 +6,7 @@
 
 |No.|Name|Ref|
 |---|---|---|
-|1|Random Network Distillation (RND)|https://arxiv.org/pdf/1810.12894.pdf|
+|1|Exploration by Random Network Distillation (RND)|https://arxiv.org/pdf/1810.12894.pdf|
 
 - - -
 
