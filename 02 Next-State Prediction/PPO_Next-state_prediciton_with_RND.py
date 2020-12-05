@@ -49,7 +49,7 @@ class Critic_network(nn.Module):
 class Predictor_network(nn.Module):
     def __init__(self, obs_size):
         super(Predictor_network, self).__init__()
-        self.fc1 = nn.Linear(obs_size, 64) ## input obs_t+1
+        self.fc1 = nn.Linear(obs_size, 64) # input predictor: action + obs | target: next_obs
         self.fc2 = nn.Linear(64,64)
         self.fc3 = nn.Linear(64,64)
         self.fc4 = nn.Linear(64,1) ## output f(st+1)
@@ -112,15 +112,22 @@ def observation_normalize(observation, obs_std): # In order to normalize observa
     observation = (observation - obs_mean) / obs_std
     return observation
 
-def get_MSE(predictor, target_predictor, next_observation, obs_std):
+def get_MSE(predictor, target_predictor, observation, onehot_action, next_observation, obs_std):
     MSE = torch.nn.MSELoss() # define loss function.
+
+    obs = torch.Tensor(observation_normalize(observation, obs_std))
+    obs = torch.clamp(obs, -5, 5)
     next_obs = torch.Tensor(observation_normalize(next_observation, obs_std)) # normalize observation.
-    next_obs = torch.clamp(next_obs, -5, 5) 
-    f_prime = predictor(next_obs) # predictor
-    f = target_predictor(next_obs) # target predictor (fixed!)
+    next_obs = torch.clamp(next_obs, -5, 5)
+
+    obs_action = torch.cat((obs, onehot_action), -1)
+
+    f_prime = predictor(obs_action) # predictor | input is [obs, onehot_action]
+    f = target_predictor(next_obs) # target predictor (fixed!) | input is [next_obs]
+
     return MSE(f_prime, f.detach())
 
-def train(actor, critic, predictor, target_predictor, trajectories, actor_optimizer, critic_optimizer, predictor_optimizer, T_horizon, batch_size, epoch, obs_std):
+def train(actor, critic, predictor, target_predictor, trajectories, actor_optimizer, critic_optimizer, predictor_optimizer, T_horizon, batch_size, epoch, obs_std, action_size):
     
     c_1 = 1
     c_2 = 0.0 # entropy bonus is zero, because we are using RND which is exploration technique.
@@ -129,28 +136,30 @@ def train(actor, critic, predictor, target_predictor, trajectories, actor_optimi
     trajectories = np.array(trajectories) ##deque인 type을 np.array로 바꿔 줍니다.
     obs = np.vstack(trajectories[:, 0]) 
     action = list(trajectories[:, 1])
-    next_obs = np.vstack(trajectories[:, 2])
-    extrinsic_reward = list(trajectories[:, 3])
-    intrinsic_reward = list(trajectories[:, 4])
-    mask = list(trajectories[:, 5]) 
-    old_policy = np.vstack(trajectories[:, 6])
+    onehot_action = np.vstack(trajectories[:, 2])
+    next_obs = np.vstack(trajectories[:, 3])
+    extrinsic_reward = list(trajectories[:, 4])
+    intrinsic_reward = list(trajectories[:, 5])
+    mask = list(trajectories[:, 6])
+    old_policy = np.vstack(trajectories[:, 7])
     
     obs = torch.Tensor(obs)
     action = torch.LongTensor(action).unsqueeze(1)
+    onehot_action = torch.Tensor(onehot_action)
     next_obs = torch.Tensor(next_obs)
+    extrinsic_reward = torch.Tensor(extrinsic_reward)
+    intrinsic_reward = torch.Tensor(intrinsic_reward)
     mask = torch.Tensor(mask)
     old_policy = torch.Tensor(old_policy)
  
     """ update predictor """
-    predictor_loss = get_MSE(predictor, target_predictor, next_obs.numpy(), obs_std)
+    predictor_loss = get_MSE(predictor, target_predictor, obs.numpy(), onehot_action, next_obs.numpy(), obs_std)
     predictor_optimizer.zero_grad()
     predictor_loss.backward()
     predictor_optimizer.step()
 
     obs_std = torch.std(obs, 0).numpy()
 
-    extrinsic_reward = torch.Tensor(extrinsic_reward)
-    intrinsic_reward = torch.Tensor(intrinsic_reward)
     intrinsic_reward = intrinsic_reward / torch.std(intrinsic_reward) # normalize intrinsic reward.
       
     """ calculate Return and Advantage """
@@ -186,12 +195,12 @@ def train(actor, critic, predictor, target_predictor, trajectories, actor_optimi
             old_policy_b = old_policy[mini_batch].detach()
             
             Advantage_b = Advantage[mini_batch].unsqueeze(1)
-
+                        
             ratio, L_CPI, entropy = surrogate_loss(actor, old_policy_b, Advantage_b, obs_b, action_b)
 
             entropy = entropy.mean()
             clipped_surrogate = torch.clamp(ratio,1-eps,1+eps) * Advantage_b
-            actor_loss = -torch.min(L_CPI.mean(), clipped_surrogate.mean())
+            actor_loss = -torch.min(L_CPI.mean(),clipped_surrogate.mean())
 
             """ total loss """        
             L_CLIP= actor_loss + c_1 * critic_loss - c_2 * entropy
@@ -203,7 +212,7 @@ def train(actor, critic, predictor, target_predictor, trajectories, actor_optimi
             critic_optimizer.zero_grad()
             L_CLIP.backward() 
             critic_optimizer.step()
-        
+
     return obs_std
 
 
@@ -218,7 +227,7 @@ def main():
     action_size = 2
     actor = Actor_network(obs_size, action_size) ## actor 생성
     critic = Critic_network(obs_size) ## critic 생성
-    predictor = Predictor_network(obs_size) ## predictor 생성
+    predictor = Predictor_network(obs_size + action_size) ## predictor 생성
     target_predictor = Predictor_network(obs_size) ## target predictor 생성
 
     learning_rate = 0.0003
@@ -265,41 +274,42 @@ def main():
 
         for i in range(maximum_steps):
             #env.render() ## 게임을 실시간으로 실행하는 명령
-            
+
             action_distribution = actor(torch.Tensor(obs)) ##actor로 부터 action에 대한 softmax distribution을 얻는다.
             action = get_action(action_distribution) ## sampling action.
             old_policy = action_distribution[action] # 실제 선택된 action의 확률 값을 loss 계산을 위해 저장한다.
 
             next_obs, extrinsic_reward, done, info = env.step(action) ## 선택된 가장 높은 action이 다음 step에 들어감.
-            
-            intrinsic_reward = get_MSE(predictor, target_predictor, next_obs, obs_std).item() # || f'(st+1) - f(st+1) ||^2
-        
+            onehot_action = torch.zeros(action_size)
+            onehot_action[action] = 1.0
+
+            intrinsic_reward = get_MSE(predictor, target_predictor, obs, onehot_action, next_obs, obs_std).item() # || f'(st+1) - f(st+1) ||^2
+
             mask = 0 if done else 1 ## 게임이 종료됬으면, done이 1이면 mask = 0 생존유무 확인.
                 
-            trajectories.append((obs, action, next_obs, extrinsic_reward, intrinsic_reward, mask, old_policy.detach().numpy()))
+            trajectories.append((obs, action, onehot_action, next_obs, extrinsic_reward, intrinsic_reward, mask, old_policy.detach().numpy()))
             obs = next_obs # current observation을 next_observation으로 변경
-                
+            
             ex_score += extrinsic_reward # extrinsic_reward 갱신.
             in_score += intrinsic_reward # intrinsic_reward 갱신.
             step += 1
 
             if step % T_horizon == 0 and step != 0:
-                obs_std = train(actor, critic, predictor, target_predictor, trajectories, actor_optimizer, critic_optimizer, predictor_optimizer, T_horizon, batch_size, epoch, obs_std) ## 본격적인 학습을 위한 train 함수.
+                obs_std = train(actor, critic, predictor, target_predictor, trajectories, actor_optimizer, critic_optimizer, predictor_optimizer, T_horizon, batch_size, epoch, obs_std, action_size) ## 본격적인 학습을 위한 train 함수.
                 trajectories = deque() ## (s,a,r,done 상태) 를 저장하는 history or trajectories라고 부름. 학습을 위해 저장 되어지는 경험 메모리라고 보면됨.
                 
             if done: ## 죽었다면 게임 초기화를 위한 반복문 탈출
                 break
       
-            
         if epi % print_interval == 0 and epi != 0:
             save_ex_score.append(ex_score/print_interval) ## reward score 저장.
             save_in_score.append(in_score/print_interval)
-            print('episode: ',epi,' step: ', step, 'ex_score: ', ex_score/print_interval, 'in_score: ', in_score/print_interval) # log 출력.
+            print('episode: ', epi,' step: ', step, 'ex_score: ', ex_score/print_interval, 'in_score: ', in_score/print_interval) # log 출력.
             ex_score = 0
             in_score = 0
-            with open('RND_ex.p', 'wb') as file:
+            with open('NSP_RND_ex.p', 'wb') as file:
                 pickle.dump(save_ex_score, file)
-            with open('RND_in.p', 'wb') as file:
+            with open('NSP_RND_in.p', 'wb') as file:
                 pickle.dump(save_in_score, file)
         
     env.close() ## 모든 학습이 끝나면 env 종료.
